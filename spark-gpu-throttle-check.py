@@ -795,8 +795,17 @@ def run_test(args, gpu_index: int = None) -> int:
     nvml = NVMLDirect()
     use_nvml = nvml.init(gpu_index=gpu_index)
 
-    if not use_nvml and not quiet:
-        print(f"  {YELLOW}NVML direct init failed — falling back to nvidia-smi{RESET}")
+    if not use_nvml:
+        # Validate GPU index — don't silently fall back to GPU 0
+        temp_nvml = NVMLDirect()
+        if temp_nvml._load_lib():
+            count = temp_nvml.get_device_count()
+            temp_nvml.shutdown()
+            if gpu_index >= count:
+                print(f"ERROR: GPU {gpu_index} not found. System has {count} GPU(s) (index 0-{count-1}).")
+                return 1
+        if not quiet:
+            print(f"  {YELLOW}NVML direct init failed — falling back to nvidia-smi{RESET}")
 
     if not quiet:
         print("=" * 60)
@@ -941,7 +950,7 @@ def run_test(args, gpu_index: int = None) -> int:
     peak_clk = max(clocks)
     avg_clk = sum(clocks) / len(clocks)
     avg_pwr = sum(powers) / len(powers) if powers else 0
-    avg_temp = sum(temps) / len(temps) if temps else 0
+    avg_temp = sum(temps) / len(temps) if temps else None
     pct_below = sum(1 for c in clocks if c < threshold_mhz) / len(clocks) * 100
 
     # Ramp time
@@ -974,8 +983,7 @@ def run_test(args, gpu_index: int = None) -> int:
         print(f"  Peak clock:      {peak_clk:.0f} MHz")
         print(f"  Average clock:   {avg_clk:.0f} MHz")
         print(f"  Avg power draw:  {avg_pwr:.1f} W")
-        if temps:
-            print(f"  Avg temperature: {avg_temp:.0f} °C")
+        print(f"  Avg temperature: {fmt(avg_temp, '.0f')} °C")
         print(f"  Below threshold: {pct_below:.0f}% of samples < {threshold_mhz:.0f} MHz")
 
         # Ramp time
@@ -1078,7 +1086,7 @@ def run_test(args, gpu_index: int = None) -> int:
         "peak_clk": peak_clk,
         "avg_clk": round(avg_clk, 1),
         "avg_power": round(avg_pwr, 1),
-        "avg_temp": round(avg_temp, 1),
+        "avg_temp": round(avg_temp, 1) if avg_temp is not None else None,
         "pct_below": round(pct_below, 1),
         "threshold": threshold_mhz,
         "num_samples": len(clocks),

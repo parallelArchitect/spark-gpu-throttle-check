@@ -1,21 +1,143 @@
-# spark-gpu-throttle-check
+# spark-gpu-throttle-check (enhanced)
 
-A diagnostic tool for detecting GPU clock throttling on NVIDIA DGX Spark (and related GB10) systems suspected to be caused by bad USB Power Delivery (PD) negotiation.
+A GPU throttle diagnostic tool for NVIDIA DGX Spark (GB10) and other NVIDIA systems. Detects clock throttling, identifies the cause, and tracks GPU health over time.
+
+> **Fork of [hoesing/spark-gpu-throttle-check](https://github.com/hoesing/spark-gpu-throttle-check)**
+> Original tool detects USB PD throttling. This fork adds NVML direct telemetry,
+> throttle cause identification, PCIe link monitoring, stability analysis, and
+> baseline drift detection.
 
 ## The Problem
 
-DGX Spark systems can occasionally end up in a degraded power state where the GPU remains in P0 state but its clock speed is capped far below normal — typically below 850 MHz instead of the expected ~2400 MHz. This causes significant performance degradation that can be difficult to diagnose since the GPU otherwise appears healthy. Faulty USB PD negotiation with the power brick is a suspected cause.
+DGX Spark systems can end up in a degraded power state where the GPU clock is capped far below normal — typically 500–850 MHz instead of ~2400 MHz. This causes significant performance degradation that's difficult to diagnose since the GPU otherwise appears healthy. Bad USB PD negotiation is a common cause, but thermal throttling, hardware slowdown, and power cap violations can produce similar symptoms.
 
-## What This Tool Does
+The original tool answers: **"Is the GPU throttled?"**
 
-The script loads the GPU with a sustained compute workload (4096×4096 FP32 matrix multiplications via cuBLAS) and monitors the clock speed. Under normal power delivery, the GPU should ramp up well past 1400 MHz. If the clocks stay below the threshold under full load, the GPU is being power-throttled.
+This enhanced version answers: **"Is the GPU throttled, why, and is it getting worse?"**
 
-No pip packages are required — the script calls cuBLAS directly via ctypes using the CUDA runtime libraries that ship with the NVIDIA driver.
+## Why This Happens on DGX Spark
+
+The DGX Spark uses USB Power Delivery (PD) negotiation with its power brick. When PD negotiation fails or enters a degraded state, the GPU remains in P0 but its clock speed is capped — typically 500–850 MHz instead of the expected ~2400 MHz. The GPU reports no errors and appears healthy to `nvidia-smi`, but performance drops by 60–80%.
+
+Common triggers:
+- Power brick disconnected/reconnected without a full discharge cycle
+- Firmware updates that change PD negotiation behavior
+- Faulty or marginal USB-C power cables
+- Multiple power events (outages, surges) without a clean reset
+
+The fix is usually a full power cycle: disconnect the power brick from both the wall and the Spark, wait 60 seconds, then reconnect. This forces a fresh PD negotiation.
+
+This tool detects the condition and tells you whether the cause is power delivery, thermal throttling, or hardware-level slowdown — so you know whether to power cycle, check cooling, or contact NVIDIA.
+
+## What's New (v2.0)
+
+### NVML Direct Telemetry
+Replaces `nvidia-smi` subprocess calls with direct NVML reads via ctypes. Faster sampling, richer data, no parsing overhead. Falls back to `nvidia-smi` if NVML library isn't found.
+
+### Throttle Cause Identification
+Decodes the NVML throttle reason bitmask into human-readable causes:
+
+| Bitmask | Reason | What it means |
+|---------|--------|---------------|
+| `0x01` | `GPU_IDLE` | Normal idle state |
+| `0x04` | `SW_POWER_CAP` | Software power limit hit |
+| `0x08` | `HW_SLOWDOWN` | Hardware-enforced slowdown (power or thermal) |
+| `0x20` | `SW_THERMAL_SLOWDOWN` | Driver thermal limit hit |
+| `0x40` | `HW_THERMAL_SLOWDOWN` | Hardware thermal limit hit |
+| `0x80` | `HW_POWER_BRAKE_SLOWDOWN` | Hardware power brake engaged |
+
+The FAIL banner now tells you **why** clocks are low — power issue vs thermal issue vs hardware slowdown — instead of always suggesting USB PD.
+
+### Clock Ramp-Up Timing
+Measures how long the GPU takes to reach the threshold clock speed from idle. A healthy GPU ramps in under 1 second. Slow ramp-up can indicate power delivery issues.
+
+### Clock Stability Score
+Reports coefficient of variation (CV%) across all samples:
+- **< 1% CV** — rock solid
+- **1–5% CV** — minor variance
+- **> 5% CV** — oscillating clocks, investigate
+
+### Thermal Trajectory
+Linear regression on temperature vs time during the test. Reports slope (°C/s), direction (rising/stable/cooling), and start→end temperatures. Rising temperature with dropping clocks = thermal throttle developing in real time.
+
+### PCIe Link Monitoring
+Captures PCIe link speed and width before and after the SGEMM load via `lspci`. Warns if the link degraded during the test — a signal of PCIe-level instability that can precede Xid 79 (GPU fell off bus) failures.
+
+### Run-Length Display
+Duplicate samples are collapsed into ranges instead of printing 20 identical rows:
+
+```
+       #  Clock    Max  PSt    Pwr   T°C  Fan%  Throttle
+  ──────  ──────  ─────  ───  ─────  ────  ────  ────────
+    1-20  1860   1911   P2  132.8    58     0  none (20x)
+```
+
+### Baseline / Compare
+Save a healthy GPU snapshot and compare against it later:
+
+```bash
+# When GPU is healthy
+python3 spark-gpu-throttle-check.py --save-baseline
+
+# Later, when something seems wrong
+python3 spark-gpu-throttle-check.py --compare
+```
+
+Shows delta for peak clock, average clock, power, temperature, and stability score — highlights regressions in color.
+
+### JSON Report Export
+Full machine-readable report with every sample, PCIe state, and all analysis:
+
+```bash
+python3 spark-gpu-throttle-check.py --report
+```
+
+Reports are saved to `~/.spark-throttle/reports/` with timestamps. Attach these to bug reports for complete diagnostic evidence.
+
+### Multi-GPU Support
+Test a specific GPU or all GPUs in the system:
+
+```bash
+# Test GPU 1
+python3 spark-gpu-throttle-check.py --gpu 1
+
+# Test every GPU
+python3 spark-gpu-throttle-check.py --all-gpus
+```
+
+### Timeline Mode
+High-frequency 100ms sampling to capture the clock ramp-up curve and catch transient throttle events:
+
+```bash
+python3 spark-gpu-throttle-check.py --timeline -n 50
+```
 
 ## Usage
 
 ```bash
+# Standard check (20 samples, 500ms intervals)
 python3 spark-gpu-throttle-check.py
+
+# Quick check with more samples
+python3 spark-gpu-throttle-check.py -n 50
+
+# Timeline capture
+python3 spark-gpu-throttle-check.py --timeline -n 40
+
+# Save baseline when healthy
+python3 spark-gpu-throttle-check.py --save-baseline
+
+# Compare against baseline
+python3 spark-gpu-throttle-check.py --compare
+
+# Full diagnostic with report
+python3 spark-gpu-throttle-check.py --report --save-baseline
+
+# Test all GPUs
+python3 spark-gpu-throttle-check.py --all-gpus
+
+# Quiet mode for scripting
+python3 spark-gpu-throttle-check.py -q
 ```
 
 ### Options
@@ -25,37 +147,18 @@ python3 spark-gpu-throttle-check.py
 | `-n`, `--samples` | 20 | Number of samples to collect |
 | `-t`, `--threshold` | 1400 | Clock threshold (MHz) below which throttling is suspected |
 | `-w`, `--warmup` | 2.0 | Warm-up time (seconds) before sampling begins |
-| `-q`, `--quiet` | off | Suppress sample table and details; print only a PASS/FAIL result line |
-
-### Examples
-
-```bash
-# Quick check with defaults
-python3 spark-gpu-throttle-check.py
-
-# Longer run with more samples
-python3 spark-gpu-throttle-check.py -n 50
-
-# More lenient check (only flag if below 1000 MHz)
-python3 spark-gpu-throttle-check.py -t 1000
-
-# Longer warm-up if the first sample still shows low power draw
-python3 spark-gpu-throttle-check.py -w 3
-
-# Quiet mode for scripting — prints only PASS/FAIL result line
-python3 spark-gpu-throttle-check.py -q
-```
+| `-g`, `--gpu` | 0 | GPU index to test |
+| `-q`, `--quiet` | — | Print only PASS/FAIL result line |
+| `--timeline` | — | 100ms time-series mode |
+| `--all-gpus` | — | Test every GPU in the system |
+| `--save-baseline` | — | Save current results as baseline |
+| `--compare` | — | Compare against saved baseline |
+| `--report` | — | Export full JSON report |
 
 ### Exit Codes
 
 - `0` — PASS, GPU clocks are healthy
 - `1` — FAIL or WARNING, GPU appears throttled
-
-This makes it easy to use in scripts:
-
-```bash
-python3 spark-gpu-throttle-check.py -q && echo "GPU clocks OK" || echo "Possible PD issue detected"
-```
 
 ## Sample Output
 
@@ -63,68 +166,104 @@ python3 spark-gpu-throttle-check.py -q && echo "GPU clocks OK" || echo "Possible
 
 ```
 ============================================================
-  Spark GPU Throttle Check
+  Spark GPU Throttle Check — GPU 0 (enhanced)
 ============================================================
 
-GPU state at idle:
-  Clock:       208 / 3003 MHz
-  P-state:     P8
-  Power:       4.5 W
+  GPU:     NVIDIA GeForce GTX 1080
+  Driver:  535.274.02
 
-Warming up GPU (2.0s)...
+  Idle:
+    Clock:     582 / 1911 MHz
+    P-state:   P8
+    Power:     13.8 W
+    Temp:      48 °C
+    Throttle:  idle
 
-Collecting 20 samples under load (0.5s interval)...
-Threshold: 1400 MHz
+  Collecting 20 samples (500ms), threshold 1400 MHz
 
-      #  Clock (MHz)  Max (MHz)  PState  Power (W)
-  ─────  ───────────  ─────────  ──────  ─────────
-      1         2424       3003      P0       87.2
-      2         2424       3003      P0       87.6
-     ...
-     20         2483       3003      P0       89.4
+         #  Clock    Max  PSt    Pwr   T°C  Fan%  Throttle
+  ────────  ──────  ─────  ───  ─────  ────  ────  ────────────
+      1-20  1860   1911   P2  132.8    58     0  none (20x)
 
 ────────────────────────────────────────────────────────────
   RESULTS
 ────────────────────────────────────────────────────────────
   Samples:         20
-  Peak clock:      2483 MHz
-  Average clock:   2446 MHz
-  Avg power draw:  84.0 W
+  Peak clock:      1860 MHz
+  Average clock:   1860 MHz
+  Avg power draw:  132.8 W
+  Avg temperature: 58 °C
   Below threshold: 0% of samples < 1400 MHz
+  Ramp-up time:    0.00s
+  Clock stability: 0.00% CV (rock solid)
+  Thermal trend:   rising (+0.36 °C/s) 56→60°C
 
   ┌────────────────────────────────────────────────────────┐
   │  PASS — GPU clocks look healthy under load.            │
-  │  Peak: 2483 MHz, Avg: 2446 MHz                         │
+  │  Peak: 1860 MHz, Avg: 1860 MHz                         │
   └────────────────────────────────────────────────────────┘
 ```
 
-### Throttled System (Suspected Bad PD)
+### Throttled System (USB PD Issue)
 
 ```
-      #  Clock (MHz)  Max (MHz)  PState  Power (W)
-  ─────  ───────────  ─────────  ──────  ─────────
-      1          481       3003      P0        5.8   (red)
-      2          858       3003      P0       15.8   (red)
-     ...
-     20          507       3003      P0       11.1   (red)
-
   ██████████████████████████████████████████████████████████
   █  FAIL — GPU IS THROTTLED                               █
-  █  Clock never exceeded threshold under load.            █
-  █  Likely cause: bad USB PD power negotiation.           █
-  █  Try: disconnect power brick from wall and Spark,      █
-  █  wait a minute, then reconnect.                        █
+  █  Clock never exceeded 1400 MHz under load.             █
+  █  Cause: POWER — bad USB PD or PSU issue.               █
+  █  Try: disconnect power, wait 60s, reconnect.           █
   ██████████████████████████████████████████████████████████
 ```
 
-Failing samples and the FAIL banner are displayed in red in the terminal.
+### Thermal Throttle
 
-## Fix
+```
+  ██████████████████████████████████████████████████████████
+  █  FAIL — GPU IS THROTTLED                               █
+  █  Clock never exceeded 1400 MHz under load.             █
+  █  Cause: THERMAL — GPU overheating.                     █
+  █  Check: fan speed, airflow, thermal paste.             █
+  ██████████████████████████████████████████████████████████
+```
 
-If the tool reports a failure, try disconnecting the power brick from both the wall outlet and the Spark. Wait a minute, then reconnect. Run the check again to verify the issue is resolved.
+### Baseline Comparison
+
+```
+────────────────────────────────────────────────────────────
+  BASELINE COMPARISON
+────────────────────────────────────────────────────────────
+  Baseline from: 2026-03-21T11:10:03.975510+00:00
+
+  Peak clock (MHz)        now: 1847  base: 1847  +0
+  Avg clock (MHz)         now: 1845  base: 1841  +4
+  Avg power (W)           now: 132.9  base: 131.2  +1.7
+  Avg temp (°C)           now: 65  base: 66  -1
+```
+
+## Fix for PD Throttling
+
+If the tool reports a FAIL with a power-related cause, try disconnecting the power brick from both the wall outlet and the Spark. Wait a minute, then reconnect. Run the check again to verify.
 
 ## Requirements
 
 - Python 3.10+
-- NVIDIA GPU driver with cuBLAS and CUDA runtime libraries (standard on DGX OS)
-- `nvidia-smi` in PATH
+- NVIDIA GPU driver with NVML, cuBLAS, and CUDA runtime libraries
+- `nvidia-smi` in PATH (fallback only)
+- `lspci` for PCIe monitoring (optional)
+
+No pip packages required.
+
+## Credits
+
+- Original tool: [hoesing/spark-gpu-throttle-check](https://github.com/hoesing/spark-gpu-throttle-check)
+- Enhanced by: [parallelArchitect](https://github.com/parallelArchitect) — human–AI collaborative engineering
+
+## Related Tools
+
+- [gpu-pcie-path-validator](https://github.com/parallelArchitect/gpu-pcie-path-validator) — sustained PCIe transport validation with replay counter monitoring
+- [unified-memory-analyzer](https://github.com/parallelArchitect/cuda-unified-memory-analyzer) — CUDA Unified Memory fault and migration diagnostics
+- [nvidia-gpu-val](https://github.com/parallelArchitect/nvidia-gpu-val) — gated GPU validation pipeline (PCIe → memory → compute → drift)
+
+## License
+
+MIT License
