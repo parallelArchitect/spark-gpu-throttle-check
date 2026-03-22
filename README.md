@@ -4,8 +4,8 @@ A GPU throttle diagnostic tool for NVIDIA DGX Spark (GB10) and other NVIDIA syst
 
 > **Fork of [hoesing/spark-gpu-throttle-check](https://github.com/hoesing/spark-gpu-throttle-check)**
 > Original tool detects USB PD throttling. This fork adds NVML direct telemetry,
-> throttle cause identification, PCIe link monitoring, stability analysis, and
-> baseline drift detection.
+> throttle cause identification, PCIe link monitoring, GPU utilization gating,
+> stability analysis, and baseline drift detection.
 
 ## The Problem
 
@@ -13,9 +13,11 @@ DGX Spark systems can end up in a degraded power state where the GPU clock is ca
 
 The original tool answers: **"Is the GPU throttled?"**
 
-This enhanced version answers: **"Is the GPU throttled, why, and is it getting worse?"**
+This enhanced version answers: **"Is the GPU throttled, why, is the test reliable, and is it getting worse?"**
 
 ## Why This Happens on DGX Spark
+
+For hardware specifications, see the [DGX Spark Hardware Overview](https://docs.nvidia.com/dgx/dgx-spark/hardware.html).
 
 The DGX Spark uses USB Power Delivery (PD) negotiation with its power brick. When PD negotiation fails or enters a degraded state, the GPU remains in P0 but its clock speed is capped — typically 500–850 MHz instead of the expected ~2400 MHz. The GPU reports no errors and appears healthy to `nvidia-smi`, but performance drops by 60–80%.
 
@@ -29,7 +31,7 @@ The fix is usually a full power cycle: disconnect the power brick from both the 
 
 This tool detects the condition and tells you whether the cause is power delivery, thermal throttling, or hardware-level slowdown — so you know whether to power cycle, check cooling, or contact NVIDIA.
 
-## What's New (v2.0)
+## Features
 
 ### NVML Direct Telemetry
 Replaces `nvidia-smi` subprocess calls with direct NVML reads via ctypes. Faster sampling, richer data, no parsing overhead. Falls back to `nvidia-smi` if NVML library isn't found.
@@ -46,7 +48,13 @@ Decodes the NVML throttle reason bitmask into human-readable causes:
 | `0x40` | `HW_THERMAL_SLOWDOWN` | Hardware thermal limit hit |
 | `0x80` | `HW_POWER_BRAKE_SLOWDOWN` | Hardware power brake engaged |
 
-The FAIL banner now tells you **why** clocks are low — power issue vs thermal issue vs hardware slowdown — instead of always suggesting USB PD.
+The FAIL banner tells you **why** clocks are low — power issue vs thermal issue vs hardware slowdown — instead of always suggesting USB PD.
+
+### GPU Utilization Monitoring
+Reads GPU utilization directly from NVML via `nvmlDeviceGetUtilizationRates`. The Util% column shows real-time GPU saturation during the test. A healthy GPU under the cuBLAS SGEMM load should show 95–100% utilization.
+
+### Load Adequacy Gate
+If average GPU utilization during the test is below 80%, the verdict is `INCONCLUSIVE` instead of `FAIL`. This prevents false throttle diagnosis when the load generator failed to saturate the GPU or another workload is competing for resources. A low-clock reading on a half-idle GPU is noise, not a diagnosis.
 
 ### Clock Ramp-Up Timing
 Measures how long the GPU takes to reach the threshold clock speed from idle. A healthy GPU ramps in under 1 second. Slow ramp-up can indicate power delivery issues.
@@ -67,9 +75,9 @@ Captures PCIe link speed and width before and after the SGEMM load via `lspci`. 
 Duplicate samples are collapsed into ranges instead of printing 20 identical rows:
 
 ```
-       #  Clock    Max  PSt    Pwr   T°C  Fan%  Throttle
-  ──────  ──────  ─────  ───  ─────  ────  ────  ────────
-    1-20  1860   1911   P2  132.8    58     0  none (20x)
+       #  Clock    Max  PSt    Pwr   T°C  Util%  Throttle
+  ──────  ──────  ─────  ───  ─────  ────  ─────  ────────
+    1-20  1860   1911   P2  132.8    58    100  none (20x)
 ```
 
 ### Baseline / Compare
@@ -86,7 +94,7 @@ python3 spark-gpu-throttle-check.py --compare
 Shows delta for peak clock, average clock, power, temperature, and stability score — highlights regressions in color.
 
 ### JSON Report Export
-Full machine-readable report with every sample, PCIe state, and all analysis:
+Full machine-readable report with every sample, PCIe state, utilization, and all analysis:
 
 ```bash
 python3 spark-gpu-throttle-check.py --report
@@ -158,11 +166,20 @@ python3 spark-gpu-throttle-check.py -q
 ### Exit Codes
 
 - `0` — PASS, GPU clocks are healthy
-- `1` — FAIL or WARNING, GPU appears throttled
+- `1` — FAIL, WARNING, or INCONCLUSIVE
+
+### Verdicts
+
+| Verdict | Meaning |
+|---------|---------|
+| `PASS` | Clocks healthy under load |
+| `FAIL` | Clocks below threshold — cause identified in banner |
+| `WARNING` | Intermittent low clocks or problem throttle reasons detected |
+| `INCONCLUSIVE` | GPU utilization too low for reliable verdict (< 80%) |
 
 ## Sample Output
 
-### Healthy System
+### Healthy System (v2.1)
 
 ```
 ============================================================
@@ -181,9 +198,9 @@ python3 spark-gpu-throttle-check.py -q
 
   Collecting 20 samples (500ms), threshold 1400 MHz
 
-         #  Clock    Max  PSt    Pwr   T°C  Fan%  Throttle
-  ────────  ──────  ─────  ───  ─────  ────  ────  ────────────
-      1-20  1860   1911   P2  132.8    58     0  none (20x)
+         #  Clock    Max  PSt    Pwr   T°C  Util%  Throttle
+  ────────  ──────  ─────  ───  ─────  ────  ─────  ────────────
+      1-20  1860   1911   P2  132.8    58    100  none (20x)
 
 ────────────────────────────────────────────────────────────
   RESULTS
@@ -193,6 +210,7 @@ python3 spark-gpu-throttle-check.py -q
   Average clock:   1860 MHz
   Avg power draw:  132.8 W
   Avg temperature: 58 °C
+  GPU utilization: 100%
   Below threshold: 0% of samples < 1400 MHz
   Ramp-up time:    0.00s
   Clock stability: 0.00% CV (rock solid)
@@ -226,6 +244,17 @@ python3 spark-gpu-throttle-check.py -q
   ██████████████████████████████████████████████████████████
 ```
 
+### Insufficient Load
+
+```
+  ┌────────────────────────────────────────────────────────┐
+  │  INCONCLUSIVE — GPU load was insufficient.             │
+  │  Avg utilization: 42% (need ≥80% for reliable verdict).│
+  │  The load generator may have failed to saturate the GPU.│
+  │  Rerun the test or check for competing workloads.      │
+  └────────────────────────────────────────────────────────┘
+```
+
 ### Baseline Comparison
 
 ```
@@ -238,11 +267,22 @@ python3 spark-gpu-throttle-check.py -q
   Avg clock (MHz)         now: 1845  base: 1841  +4
   Avg power (W)           now: 132.9  base: 131.2  +1.7
   Avg temp (°C)           now: 65  base: 66  -1
+  Stability (%CV)         now: 0.00  base: 0.00  +0.00
 ```
 
 ## Fix for PD Throttling
 
-If the tool reports a FAIL with a power-related cause, try disconnecting the power brick from both the wall outlet and the Spark. Wait a minute, then reconnect. Run the check again to verify.
+If the tool reports a FAIL with a power-related cause, try disconnecting the power brick from both the wall outlet and the Spark. Wait a minute, then reconnect. Run the check again to verify:
+
+```bash
+# Capture throttled state
+python3 spark-gpu-throttle-check.py --save-baseline
+
+# Power cycle the brick (unplug from wall, wait 60s, reconnect)
+
+# Verify recovery
+python3 spark-gpu-throttle-check.py --compare
+```
 
 ## Requirements
 
@@ -263,6 +303,7 @@ No pip packages required.
 - [gpu-pcie-path-validator](https://github.com/parallelArchitect/gpu-pcie-path-validator) — sustained PCIe transport validation with replay counter monitoring
 - [unified-memory-analyzer](https://github.com/parallelArchitect/cuda-unified-memory-analyzer) — CUDA Unified Memory fault and migration diagnostics
 - [nvidia-gpu-val](https://github.com/parallelArchitect/nvidia-gpu-val) — gated GPU validation pipeline (PCIe → memory → compute → drift)
+- [nvml-unified-shim](https://github.com/parallelArchitect/nvml-unified-shim) — fixes NVML memory reporting on UMA platforms (MemAvailable + SwapFree instead of MemTotal)
 
 ## License
 
