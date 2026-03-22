@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-spark-gpu-throttle-check.py — Enhanced GPU throttle diagnostic for DGX Spark
+spark-gpu-throttle-check.py v2.1.0 — Enhanced GPU throttle diagnostic for DGX Spark
 and other NVIDIA systems.
 
 Original tool by hoesing: detect USB PD clock throttling via cuBLAS load.
 Enhanced by parallelArchitect: NVML direct telemetry, throttle reason decoder,
 PCIe link snapshot, baseline/compare, timeline, ramp analysis, stability score,
-thermal trajectory, JSON report export.
+thermal trajectory, JSON report export, GPU utilization gate.
 
 Expected behavior:
   - Healthy PD:  graphics clock reaches ~2400 MHz under load
@@ -221,6 +221,20 @@ class NVMLDirect:
         rc = self._lib.nvmlDeviceGetFanSpeed(self._handle, ctypes.byref(val))
         return val.value if rc == 0 else None
 
+    def get_utilization(self) -> dict | None:
+        """Get GPU and memory controller utilization percentages."""
+        if not self._available:
+            return None
+
+        class NvmlUtilization(ctypes.Structure):
+            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+        util = NvmlUtilization()
+        rc = self._lib.nvmlDeviceGetUtilizationRates(self._handle, ctypes.byref(util))
+        if rc == 0:
+            return {"gpu_pct": util.gpu, "mem_pct": util.memory}
+        return None
+
     def get_gpu_name(self) -> str | None:
         if not self._available:
             return None
@@ -259,6 +273,7 @@ class NVMLDirect:
 
     def sample(self) -> dict:
         throttle_raw = self.get_throttle_reasons()
+        util = self.get_utilization()
         return {
             "timestamp": time.time(),
             "clk_mhz": self.get_clock_mhz(),
@@ -267,6 +282,8 @@ class NVMLDirect:
             "power_w": self.get_power_w(),
             "temp_c": self.get_temperature(),
             "fan_pct": self.get_fan_speed(),
+            "gpu_util": util["gpu_pct"] if util else None,
+            "mem_util": util["mem_pct"] if util else None,
             "throttle_raw": throttle_raw,
             "throttle_reasons": decode_throttle_bitmask(throttle_raw) if throttle_raw is not None else [],
             "throttle_problem": has_problem_throttle(throttle_raw) if throttle_raw is not None else False,
@@ -480,21 +497,21 @@ def print_run_length_table(samples: list[dict], threshold: float, timeline: bool
         groups.append((group_start, len(samples) - 1, samples[group_start]))
 
     if timeline:
-        print(f"  {'t(s)':>8s}  {'Clock':>6s}  {'Max':>5s}  {'PSt':>3s}  {'Pwr':>5s}  {'T°C':>4s}  {'Fan%':>4s}  {'Throttle'}")
-        print(f"  {'─'*8}  {'─'*6}  {'─'*5}  {'─'*3}  {'─'*5}  {'─'*4}  {'─'*4}  {'─'*20}")
+        print(f"  {'t(s)':>8s}  {'Clock':>6s}  {'Max':>5s}  {'PSt':>3s}  {'Pwr':>5s}  {'T°C':>4s}  {'Util%':>5s}  {'Throttle'}")
+        print(f"  {'─'*8}  {'─'*6}  {'─'*5}  {'─'*3}  {'─'*5}  {'─'*4}  {'─'*5}  {'─'*20}")
     else:
-        print(f"  {'#':>8s}  {'Clock':>6s}  {'Max':>5s}  {'PSt':>3s}  {'Pwr':>5s}  {'T°C':>4s}  {'Fan%':>4s}  {'Throttle'}")
-        print(f"  {'─'*8}  {'─'*6}  {'─'*5}  {'─'*3}  {'─'*5}  {'─'*4}  {'─'*4}  {'─'*20}")
+        print(f"  {'#':>8s}  {'Clock':>6s}  {'Max':>5s}  {'PSt':>3s}  {'Pwr':>5s}  {'T°C':>4s}  {'Util%':>5s}  {'Throttle'}")
+        print(f"  {'─'*8}  {'─'*6}  {'─'*5}  {'─'*3}  {'─'*5}  {'─'*4}  {'─'*5}  {'─'*20}")
 
     for start, end, representative in groups:
         clk_str = color_clock(representative.get("clk_mhz"), threshold)
         throttle_str = color_throttle(representative.get("throttle_reasons", []))
 
-        # Average power and temp across the group for display
+        # Average power, temp, utilization across the group for display
         group_samples = samples[start:end + 1]
         avg_pwr = sum(s.get("power_w", 0) or 0 for s in group_samples) / len(group_samples)
         avg_tmp = sum(s.get("temp_c", 0) or 0 for s in group_samples) / len(group_samples)
-        avg_fan = sum(s.get("fan_pct", 0) or 0 for s in group_samples) / len(group_samples)
+        avg_util = sum(s.get("gpu_util", 0) or 0 for s in group_samples) / len(group_samples)
 
         if timeline:
             t_start = representative.get("elapsed", 0)
@@ -509,7 +526,7 @@ def print_run_length_table(samples: list[dict], threshold: float, timeline: bool
                 f"  {(representative.get('pstate') or '?'):>3s}"
                 f"  {avg_pwr:5.1f}"
                 f"  {avg_tmp:4.0f}"
-                f"  {avg_fan:4.0f}"
+                f"  {avg_util:5.0f}"
                 f"  {throttle_str}"
             )
         else:
@@ -524,7 +541,7 @@ def print_run_length_table(samples: list[dict], threshold: float, timeline: bool
                 f"  {(representative.get('pstate') or '?'):>3s}"
                 f"  {avg_pwr:5.1f}"
                 f"  {avg_tmp:4.0f}"
-                f"  {avg_fan:4.0f}"
+                f"  {avg_util:5.0f}"
                 f"  {throttle_str}{count_note}"
             )
 
@@ -682,7 +699,7 @@ def export_report(results: dict, samples: list[dict], gpu_index: int = 0):
     filename = report_dir / f"throttle-check_gpu{gpu_index}_{ts}.json"
 
     report = {
-        "version": "2.0.0",
+        "version": "2.1.0",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "gpu_index": gpu_index,
         "system": {
@@ -705,6 +722,8 @@ def export_report(results: dict, samples: list[dict], gpu_index: int = 0):
             "avg_clk": results.get("avg_clk"),
             "avg_power": results.get("avg_power"),
             "avg_temp": results.get("avg_temp"),
+            "avg_util": results.get("avg_util"),
+            "load_adequate": results.get("load_adequate"),
             "pct_below": results.get("pct_below"),
             "stability_cv": results.get("stability_cv"),
             "ramp_time_s": results.get("ramp_time"),
@@ -719,6 +738,7 @@ def export_report(results: dict, samples: list[dict], gpu_index: int = 0):
                 "clk": s.get("clk_mhz"),
                 "pwr": round(s.get("power_w", 0) or 0, 1),
                 "temp": s.get("temp_c"),
+                "util": s.get("gpu_util"),
                 "pst": s.get("pstate"),
                 "thr": s.get("throttle_raw"),
             }
@@ -770,6 +790,8 @@ def _fallback_query_gpu() -> dict:
             "power_w": safe_float(parts[3]),
             "temp_c": None,
             "fan_pct": None,
+            "gpu_util": None,
+            "mem_util": None,
             "throttle_raw": throttle_raw,
             "throttle_reasons": decode_throttle_bitmask(throttle_raw),
             "throttle_problem": has_problem_throttle(throttle_raw),
@@ -946,12 +968,18 @@ def run_test(args, gpu_index: int = None) -> int:
     clocks = [s["clk_mhz"] for s in samples if s["clk_mhz"] is not None]
     powers = [s["power_w"] for s in samples if s.get("power_w") is not None]
     temps = [s["temp_c"] for s in samples if s.get("temp_c") is not None]
+    utils = [s["gpu_util"] for s in samples if s.get("gpu_util") is not None]
 
     peak_clk = max(clocks)
     avg_clk = sum(clocks) / len(clocks)
     avg_pwr = sum(powers) / len(powers) if powers else 0
     avg_temp = sum(temps) / len(temps) if temps else None
+    avg_util = sum(utils) / len(utils) if utils else None
     pct_below = sum(1 for c in clocks if c < threshold_mhz) / len(clocks) * 100
+
+    # Load adequacy gate — is the GPU actually under load?
+    LOAD_THRESHOLD = 80  # percent GPU utilization
+    load_adequate = avg_util is not None and avg_util >= LOAD_THRESHOLD
 
     # Ramp time
     ramp_time = compute_ramp_time(samples, threshold_mhz)
@@ -984,6 +1012,13 @@ def run_test(args, gpu_index: int = None) -> int:
         print(f"  Average clock:   {avg_clk:.0f} MHz")
         print(f"  Avg power draw:  {avg_pwr:.1f} W")
         print(f"  Avg temperature: {fmt(avg_temp, '.0f')} °C")
+        if avg_util is not None:
+            u_color = GREEN if avg_util >= 80 else YELLOW if avg_util >= 50 else RED
+            print(f"  GPU utilization: {u_color}{avg_util:.0f}%{RESET}", end="")
+            if not load_adequate:
+                print(f" {DIM}(load may be insufficient for reliable verdict){RESET}")
+            else:
+                print()
         print(f"  Below threshold: {pct_below:.0f}% of samples < {threshold_mhz:.0f} MHz")
 
         # Ramp time
@@ -1021,7 +1056,24 @@ def run_test(args, gpu_index: int = None) -> int:
         print()
 
     # ── Verdict ──
-    if peak_clk < threshold_mhz:
+    # Load adequacy gate: if GPU wasn't under sufficient load,
+    # clock readings are unreliable — don't issue throttle verdict
+    if not load_adequate and avg_util is not None and peak_clk < threshold_mhz:
+        verdict = "INSUFFICIENT_LOAD"
+        exit_code = 1
+        if quiet:
+            print(f"INSUFFICIENT_LOAD gpu={gpu_index} util={avg_util:.0f}% peak={peak_clk:.0f}MHz")
+        else:
+            print(f"  {YELLOW}┌" + "─" * BOX_W + "┐")
+            for line in [
+                "INCONCLUSIVE — GPU load was insufficient.",
+                f"Avg utilization: {avg_util:.0f}% (need ≥80% for reliable verdict).",
+                "The load generator may have failed to saturate the GPU.",
+                "Rerun the test or check for competing workloads.",
+            ]:
+                print(f"  │  {line:<{BOX_W - 2}}│")
+            print("  └" + "─" * BOX_W + "┘" + RESET)
+    elif peak_clk < threshold_mhz:
         verdict = "FAIL"
         exit_code = 1
         if quiet:
@@ -1087,6 +1139,8 @@ def run_test(args, gpu_index: int = None) -> int:
         "avg_clk": round(avg_clk, 1),
         "avg_power": round(avg_pwr, 1),
         "avg_temp": round(avg_temp, 1) if avg_temp is not None else None,
+        "avg_util": round(avg_util, 1) if avg_util is not None else None,
+        "load_adequate": load_adequate,
         "pct_below": round(pct_below, 1),
         "threshold": threshold_mhz,
         "num_samples": len(clocks),
